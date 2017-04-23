@@ -39,26 +39,54 @@ class ActivitiesAppController(AppController):
         db_session.add(new_task)
         db_session.commit()
 
-    def _get_current_turn(self, activity_id, db_session):
-        oldest_activity = db_session.query(func.max(ActivityEvent.datetime), ActivityEvent.user_id, ActivityEvent.id) \
+    def _get_oldest_moved_gracefully_turns(self, activity_id, db_session):
+        oldest_gracefully_moved_turn = db_session.query(
+            func.max(ActivityEvent.datetime),
+            ActivityEvent.user_id,
+            ActivityEvent.id
+        ) \
+            .filter(
+            and_(
+                ActivityEvent.status.in_(['moved_gracefully']),
+                ActivityEvent.activity_id == activity_id,
+            )
+        ) \
+            .group_by(ActivityEvent.user_id) \
+            .order_by(ActivityEvent.datetime) \
+            .all()
+        return oldest_gracefully_moved_turn
+
+    def _get_oldest_queue_activity(self, activity_id, db_session):
+        oldest_queue_turn = db_session.query(
+            func.max(ActivityEvent.datetime),
+            ActivityEvent.user_id,
+            ActivityEvent.id
+        ) \
             .filter(
             and_(
                 ActivityEvent.status.in_(['moved', 'absent', 'done', 'compensated']),
                 ActivityEvent.activity_id == activity_id,
                 ActivityEvent.assign_type == 'queue'
-            )) \
+            )
+        ) \
             .group_by(ActivityEvent.user_id) \
             .order_by(ActivityEvent.datetime) \
             .first()
-        return oldest_activity[1] if oldest_activity is not None else None
+        return oldest_queue_turn
 
     def _assign_to_activity(self, activity, db_session):
-        moved_activities = db_session.query(ActivityEvent).filter_by(status='moved', activity_id=activity.id) \
-            .order_by('datetime').all()
+
         last_activity = db_session.query(ActivityEvent).filter_by(activity_id=activity.id) \
             .order_by(ActivityEvent.datetime.desc()).first()
-        current_turn_user_id = self._get_current_turn(activity.id, db_session)
-        print("CU:" + str(current_turn_user_id))
+
+        oldest_normal_turn = self._get_oldest_queue_activity(activity.id, db_session)
+        current_turn_user_id = oldest_normal_turn[1] if oldest_normal_turn is not None else None
+        oldest_moved_gracefully_turns = self._get_oldest_moved_gracefully_turns(activity.id, db_session)
+        last_gracefully_turns_by_user_id = dict()
+        if oldest_moved_gracefully_turns is not None:
+            for moved_gracefully_turn in oldest_moved_gracefully_turns:
+                last_gracefully_turns_by_user_id[moved_gracefully_turn[1]] = moved_gracefully_turn[0]
+
         performed_users = db_session.query(distinct(ActivityEvent.user_id)) \
             .filter(ActivityEvent.activity_id == activity.id) \
             .all()
@@ -75,37 +103,45 @@ class ActivitiesAppController(AppController):
                     current_turn_user_id = user.id
                     break
 
+        moved_activities = db_session.query(ActivityEvent)\
+            .filter_by(status='moved', activity_id=activity.id)\
+            .order_by('datetime')\
+            .all()
+
         for moved_activity in moved_activities:
             if moved_activity.user_id == current_turn_user_id:
                 self._create_task(moved_activity.user_id, activity.id, db_session, False)
-                msg = "{username}, ты не выполнил свою обязанность {datetime} и очередь снова дошла до тебя." \
+                msg = "@{username}, ты не выполнил свою обязанность {datetime} и очередь снова дошла до тебя." \
                     .format(username=moved_activity.user.name, datetime=moved_activity.datetime)
                 return msg
             else:
-                if moved_activity.user_id != last_activity.user_id:
-                    self._create_task(moved_activity.user_id, activity.id, db_session, True)
-                    msg = "{username}, ты не выполнил свою обязанность {datetime}, так что твоя очередь." \
-                        .format(username=moved_activity.user.name, datetime=moved_activity.datetime)
-                    return msg
+                if moved_activity.user_id not in last_gracefully_turns_by_user_id or \
+                                moved_activity.datetime > last_gracefully_turns_by_user_id[moved_activity.user_id]:
+
+                    if moved_activity.user_id != last_activity.user_id:
+                        self._create_task(moved_activity.user_id, activity.id, db_session, True)
+                        msg = "@{username}, ты не выполнил свою обязанность {datetime}, так что твоя очередь." \
+                            .format(username=moved_activity.user.name, datetime=moved_activity.datetime)
+                        return msg
 
         self._create_task(current_turn_user_id, activity.id, db_session, False)
-        msg = "{username}, твоя очередь." \
+        msg = "@{username}, твоя очередь." \
             .format(username=names[current_turn_user_id])
         return msg
 
     def _mark_activity_as_moved(self, activity_event, db_session):
         if activity_event.assign_type == 'queue':
             activity_event.status = 'moved'
-            msg = "Увеличиваю твой долг на единицу."
+            msg = "@{username}, увеличиваю твой долг на единицу.".format(username=activity_event.user.name)
         else:
             activity_event.status = 'moved_gracefully'
-            msg = "Окей, попросим в следующий раз."
+            msg = "@{username}, я запомнила.".format(username=activity_event.user.name)
         db_session.commit()
         return msg
 
     def _mark_activity_as_absent(self, activity_event, db_session):
         activity_event.status = 'absent'
-        msg = "Я поняла."
+        msg = "@{username}, записала, что это по уважительной причине.".format(username=activity_event.user.name)
         db_session.commit()
         return msg
 
@@ -152,25 +188,48 @@ class ActivitiesAppController(AppController):
                             self._bot.send_message(message.chat.id, "Мы уже ждём, пока {username} с этим разберется."
                                                    .format(username=pending_activity.user.name))
                     elif action == self.ActionType.DONE:
-                        if pending_activity.user_id != current_user.id:
-                            self._mark_activity_as_done(pending_activity, session)
-                            self._bot.send_message(message.chat.id, "Спасибо. Дело закрыто.")
+                        if pending_activity is not None:
+                            if pending_activity.user_id != current_user.id:
+                                self._mark_activity_as_done(pending_activity, session)
+                                self._bot.send_message(message.chat.id, "Спасибо. Дело #{activity_name} закрыто."
+                                                       .format(activity_name=pending_activity.activity.do_command))
+                            else:
+                                self._bot.send_message(message.chat.id, "Ты не можешь подтвердить выполнение действия. "
+                                                                        "Попроси кого-то другого.")
                         else:
-                            self._bot.send_message(message.chat.id, "Ты не можешь подтвердить выполнение действия. "
-                                                                    "Попроси кого-то другого.")
+                            self._bot.send_message(message.chat.id, "Дело не назначено. Завершать нечего.")
                     elif action == self.ActionType.MOVE:
-                        msg = self._mark_activity_as_moved(pending_activity, session)
-                        self._bot.send_message(message.chat.id, msg)
-                        msg = self._assign_to_activity(command, session)
-                        self._bot.send_message(message.chat.id, msg)
+                        if pending_activity is not None:
+                            msg = self._mark_activity_as_moved(pending_activity, session)
+                            self._bot.send_message(message.chat.id, msg)
+                            msg = self._assign_to_activity(command, session)
+                            self._bot.send_message(message.chat.id, msg)
+                        else:
+                            self._bot.send_message(message.chat.id, "Дело не назначено. Переносить нечего.")
                     elif action == self.ActionType.ABSENT:
-                        msg = self._mark_activity_as_absent(pending_activity, session)
-                        self._bot.send_message(message.chat.id, msg)
-                        msg = self._assign_to_activity(command, session)
-                        self._bot.send_message(message.chat.id, msg)
-
+                        if pending_activity is not None:
+                            if pending_activity.user_id != current_user.id:
+                                msg = self._mark_activity_as_absent(pending_activity, session)
+                                self._bot.send_message(message.chat.id, msg)
+                                msg = self._assign_to_activity(command, session)
+                                self._bot.send_message(message.chat.id, msg)
+                            else:
+                                self._bot.send_message(message.chat.id, "Ты не можешь так сделать, хитрец. "
+                                                                        "Попроси кого-то другого.")
+                        else:
+                            self._bot.send_message(message.chat.id, "Дело не назначено. Переносить нечего.")
                 else:
                     self._bot.send_message(message.chat.id, "Ты о чём, алё?")
+        else:
+            if message.text == '/help':
+                text = "У нас есть следующие активности: \n"
+                text += '\n'.join(["#"+activity.do_command for activity in session.query(Activity).all()])
+                text += '\n\nИспользуй #команда [действие], где действие: \n'
+                text += 'сделать - попросить следующего по очереди выполнить это действие\n'
+                text += 'сделано - отметить как выполненное\n'
+                text += 'перенос - перенести на другой раз и попросить следующего\n'
+                text += 'невозможно - отметить объективную невозможность выполнения для этого человека'
+                self._bot.send_message(message.chat.id, text)
         session.close()
 
     def handle_message(self, message, session):

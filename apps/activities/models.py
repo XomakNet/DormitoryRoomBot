@@ -29,6 +29,7 @@ class ActivityEvent(Base):
 
     id = Column(Integer, primary_key=True)
     activity_id = Column(Integer, ForeignKey('activities.id'))
+    activity = relationship("Activity")
     compensated_by_id = Column(Integer, ForeignKey('activities_events.id'))
     user_id = Column(Integer, ForeignKey('users.id'))
     user = relationship("User")
