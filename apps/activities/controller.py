@@ -39,7 +39,7 @@ class ActivitiesAppController(AppController):
         db_session.add(new_task)
         db_session.commit()
 
-    def _get_oldest_moved_gracefully_turns(self, activity_id, db_session):
+    def _get_last_moved_gracefully_turns(self, activity_id, db_session):
         oldest_gracefully_moved_turn = db_session.query(
             func.max(ActivityEvent.datetime),
             ActivityEvent.user_id,
@@ -71,7 +71,7 @@ class ActivitiesAppController(AppController):
         ) \
             .group_by(ActivityEvent.user_id) \
             .order_by(ActivityEvent.datetime) \
-            .first()
+            .all()
         return oldest_queue_turn
 
     def _assign_to_activity(self, activity, db_session):
@@ -79,11 +79,17 @@ class ActivitiesAppController(AppController):
         last_activity = db_session.query(ActivityEvent).filter_by(activity_id=activity.id) \
             .order_by(ActivityEvent.datetime.desc()).first()
 
-        oldest_normal_turn = self._get_oldest_queue_activity(activity.id, db_session)
+        normal_turns = self._get_oldest_queue_activity(activity.id, db_session)
+        oldest_normal_turn = None
+        latest_normal_turn = None
+        if normal_turns is not None and len(normal_turns) > 0:
+            oldest_normal_turn = normal_turns[0]
+            latest_normal_turn = normal_turns[-1]
         current_turn_user_id = oldest_normal_turn[1] if oldest_normal_turn is not None else None
-        oldest_moved_gracefully_turns = self._get_oldest_moved_gracefully_turns(activity.id, db_session)
+        oldest_moved_gracefully_turns = self._get_last_moved_gracefully_turns(activity.id, db_session)
         last_gracefully_turns_by_user_id = dict()
-        if oldest_moved_gracefully_turns is not None:
+
+        if oldest_moved_gracefully_turns is not None and len(oldest_moved_gracefully_turns) > 0:
             for moved_gracefully_turn in oldest_moved_gracefully_turns:
                 last_gracefully_turns_by_user_id[moved_gracefully_turn[1]] = moved_gracefully_turn[0]
 
@@ -116,7 +122,7 @@ class ActivitiesAppController(AppController):
                 return msg
             else:
                 if moved_activity.user_id not in last_gracefully_turns_by_user_id or \
-                                moved_activity.datetime > last_gracefully_turns_by_user_id[moved_activity.user_id]:
+                                last_gracefully_turns_by_user_id[moved_activity.user_id] < latest_normal_turn[0]:
 
                     if moved_activity.user_id != last_activity.user_id:
                         self._create_task(moved_activity.user_id, activity.id, db_session, True)
